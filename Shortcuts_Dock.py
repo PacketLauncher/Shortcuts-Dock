@@ -376,6 +376,7 @@ class ShortcutsDock(QWidget):
             Qt.WidgetAttribute.WA_TranslucentBackground
         )
 
+        self._last_theme_state = self.read_theme_state()
         bg, border, hover = windows_taskbar_tint()
         self.setStyleSheet(f"""
             QWidget#dockPanel {{
@@ -439,9 +440,57 @@ class ShortcutsDock(QWidget):
         self.shortcuts_timer = QTimer(self)
         self.shortcuts_timer.timeout.connect(self.check_shortcuts_folder)
         self.shortcuts_timer.start(700)
+        # Windows does not reliably deliver theme-change events to tray-only Qt
+        # windows. Poll the small registry values so changes apply while running.
+        self.theme_timer = QTimer(self)
+        self.theme_timer.timeout.connect(self.check_windows_theme)
+        self.theme_timer.start(250)
         # Show shortcut names on Qt hover events, without a polling interval.
         if self.auto_hide:
             self.hide()
+
+    @staticmethod
+    def read_theme_state():
+        transparency = True
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                transparency = bool(winreg.QueryValueEx(key, "EnableTransparency")[0])
+        except OSError:
+            pass
+        return windows_system_dark_theme(), transparency
+
+    def check_windows_theme(self):
+        state = self.read_theme_state()
+        if state == self._last_theme_state:
+            return
+        self._last_theme_state = state
+        bg, border, hover = windows_taskbar_tint()
+        self.setStyleSheet(f"""
+            QWidget#dockPanel {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 8px;
+            }}
+            QWidget#dockPanel QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 5px;
+            }}
+            QWidget#dockPanel QPushButton:hover {{ background-color: {hover}; }}
+        """)
+        dark = state[0]
+        self.icon_tooltip.set_tip_colors(
+            "#303030" if dark else "#fafafa",
+            "#ffffff" if dark else "#202020",
+            "#646464" if dark else "#b8b8b8")
+        if hasattr(self, 'tray'):
+            menu = self.tray.contextMenu()
+            if menu is not None:
+                self.style_tray_menu(menu)
+                self.style_tray_slider_labels()
+        self.panel.update()
+        self.update()
 
     def get_shortcut_icon(self, shortcut):
         try:
