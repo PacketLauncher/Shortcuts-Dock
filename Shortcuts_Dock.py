@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 from PySide6.QtCore import Qt, QSize, QFileInfo, QTimer, QSettings, QPropertyAnimation, QEasingCurve, QPoint, QMimeData, QUrl, QEvent
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QDrag, QIcon, QPixmap, QPainter, QColor, QPen
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QDrag, QIcon, QPixmap, QPainter, QColor, QPen, QPainterPath
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -191,6 +191,33 @@ def style_rename_dialog(dialog):
 MIME_DOCK = "application/x-shortcuts-dock-item"
 
 
+class RoundedTooltip(QLabel):
+    """Paint the complete tooltip on a transparent native window surface."""
+
+    def __init__(self, parent=None, flags=Qt.WindowType.Widget):
+        super().__init__(parent, flags)
+        self.tip_background = QColor("#303030")
+        self.tip_foreground = QColor("#ffffff")
+        self.tip_border = QColor("#646464")
+
+    def set_tip_colors(self, background, foreground, border):
+        self.tip_background = QColor(background)
+        self.tip_foreground = QColor(foreground)
+        self.tip_border = QColor(border)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(self.tip_border, 1))
+        painter.setBrush(self.tip_background)
+        painter.drawRoundedRect(rect, 6, 6)
+        painter.setPen(self.tip_foreground)
+        painter.drawText(self.contentsRect(), self.alignment(), self.text())
+        painter.end()
+
+
 class ShortcutButton(QPushButton):
     def __init__(self, dock, path):
         super().__init__(dock.content)
@@ -312,8 +339,12 @@ class ShortcutsDock(QWidget):
         self.tooltip_button = None
         self.tooltip_started = None
         self.tooltip_visible_for = None
-        self.icon_tooltip = QLabel(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.icon_tooltip = RoundedTooltip(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.icon_tooltip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        # The tooltip is its own native window. Without a translucent window
+        # surface, Qt paints the area outside the rounded QLabel as opaque.
+        self.icon_tooltip.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.icon_tooltip.setAutoFillBackground(False)
         self.icon_tooltip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.icon_tooltip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_tooltip.setMargin(7)
@@ -524,10 +555,7 @@ class ShortcutsDock(QWidget):
             background = "#303030" if dark else "#fafafa"
             foreground = "#ffffff" if dark else "#202020"
             border = "#646464" if dark else "#b8b8b8"
-            self.icon_tooltip.setStyleSheet(
-                f"QLabel {{ background-color: {background}; color: {foreground}; "
-                f"border: 1px solid {border}; border-radius: 6px; "
-                "padding: 3px 7px; }")
+            self.icon_tooltip.set_tip_colors(background, foreground, border)
             self.icon_tooltip.setText(hovered.path.stem)
             self.icon_tooltip.adjustSize()
             width, height = self.icon_tooltip.width(), self.icon_tooltip.height()
