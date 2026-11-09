@@ -127,10 +127,12 @@ def windows_taskbar_tint():
     rgb = (32, 32, 32) if dark else (243, 243, 243)
     alpha = 205 if transparency else 255
     border = (255, 255, 255, 48) if dark else (30, 30, 30, 42)
-    hover = (255, 255, 255, 34) if dark else (0, 0, 0, 22)
+    hover = (255, 255, 255, 48) if dark else (0, 0, 0, 30)
+    pressed = (255, 255, 255, 76) if dark else (0, 0, 0, 55)
     return (f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {alpha})",
             f"rgba({border[0]}, {border[1]}, {border[2]}, {border[3]})",
-            f"rgba({hover[0]}, {hover[1]}, {hover[2]}, {hover[3]})")
+            f"rgba({hover[0]}, {hover[1]}, {hover[2]}, {hover[3]})",
+            f"rgba({pressed[0]}, {pressed[1]}, {pressed[2]}, {pressed[3]})")
 
 
 def style_icon_context_menu(menu):
@@ -227,10 +229,52 @@ class ShortcutButton(QPushButton):
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
 
+    def paintEvent(self, event):
+        """Paint the taskbar-style tile explicitly, independent of inherited QSS.
+
+        The scroll content has a transparent stylesheet which can override
+        QPushButton hover backgrounds on some Qt/Windows configurations.
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        dark = windows_system_dark_theme()
+        if self.isDown():
+            tint = QColor(255, 255, 255, 76) if dark else QColor(0, 0, 0, 55)
+        elif self.underMouse():
+            tint = QColor(255, 255, 255, 48) if dark else QColor(0, 0, 0, 30)
+        else:
+            tint = None
+        if tint is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(tint)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
+        # Paint the QIcon through Qt itself. This preserves its actual icon
+        # engine (including Windows shell icons) and handles high-DPI scaling.
+        icon = self.icon()
+        if not icon.isNull():
+            size = self.iconSize()
+            icon_rect = self.rect()
+            icon_rect.setLeft((self.width() - size.width()) // 2)
+            icon_rect.setTop((self.height() - size.height()) // 2)
+            icon_rect.setWidth(size.width())
+            icon_rect.setHeight(size.height())
+            icon.paint(painter, icon_rect, Qt.AlignmentFlag.AlignCenter,
+                       QIcon.Mode.Normal, QIcon.State.Off)
+        painter.end()
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.press_point = event.position().toPoint()
         super().mousePressEvent(event)
+        self.update()
 
     def mouseMoveEvent(self, event):
         if (self.press_point is not None and
@@ -245,6 +289,7 @@ class ShortcutButton(QPushButton):
     def mouseReleaseEvent(self, event):
         self.press_point = None
         super().mouseReleaseEvent(event)
+        self.update()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -377,7 +422,7 @@ class ShortcutsDock(QWidget):
         )
 
         self._last_theme_state = self.read_theme_state()
-        bg, border, hover = windows_taskbar_tint()
+        bg, border, hover, pressed = windows_taskbar_tint()
         self.setStyleSheet(f"""
             QWidget#dockPanel {{
                 background-color: {bg};
@@ -390,6 +435,7 @@ class ShortcutsDock(QWidget):
                 border-radius: 5px;
             }}
             QWidget#dockPanel QPushButton:hover {{ background-color: {hover}; }}
+            QWidget#dockPanel QPushButton:pressed {{ background-color: {pressed}; }}
         """)
 
         self.panel = QWidget(self)
@@ -465,7 +511,7 @@ class ShortcutsDock(QWidget):
         if state == self._last_theme_state:
             return
         self._last_theme_state = state
-        bg, border, hover = windows_taskbar_tint()
+        bg, border, hover, pressed = windows_taskbar_tint()
         self.setStyleSheet(f"""
             QWidget#dockPanel {{
                 background-color: {bg};
@@ -478,6 +524,7 @@ class ShortcutsDock(QWidget):
                 border-radius: 5px;
             }}
             QWidget#dockPanel QPushButton:hover {{ background-color: {hover}; }}
+            QWidget#dockPanel QPushButton:pressed {{ background-color: {pressed}; }}
         """)
         dark = state[0]
         self.icon_tooltip.set_tip_colors(
