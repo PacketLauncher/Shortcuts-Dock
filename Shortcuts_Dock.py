@@ -5,14 +5,18 @@ import ctypes
 import json
 import re
 import shutil
+import subprocess
+import struct
+import hashlib
+import uuid
 import winreg
 from ctypes import wintypes
 import win32com.client
 from pathlib import Path
 
 
-from PySide6.QtCore import Qt, QSize, QFileInfo, QTimer, QSettings, QPropertyAnimation, QEasingCurve, QPoint, QMimeData, QUrl, QEvent
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QDrag, QIcon, QPixmap, QPainter, QColor, QPen, QPainterPath
+from PySide6.QtCore import Qt, QSize, QFileInfo, QTimer, QSettings, QPropertyAnimation, QVariantAnimation, QEasingCurve, QPoint, QRect, QMimeData, QUrl, QEvent, QThread, Signal, QBuffer, QIODevice
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QDrag, QIcon, QPixmap, QPainter, QColor, QPen, QPainterPath, QImage, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -35,6 +39,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QScrollBar,
+    QListWidget,
     QSizePolicy,
 )
 
@@ -58,8 +63,10 @@ def application_version():
         pass
     return "Unknown"
 
+SEPARATOR_SUFFIX = ".dockseparator"
 ICON_SIZE = 24
 BUTTON_SIZE = 40
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
 SPACING = 4
 MARGIN = 4
 
@@ -100,6 +107,17 @@ def native_cursor_and_monitor():
     if not handle or not user32.GetMonitorInfoW(handle, ctypes.byref(info)):
         return None
     return point, info.rcMonitor
+
+
+def windows_accent_color():
+    """Read the actual Windows accent selected in Personalization > Colors."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\\Microsoft\\Windows\\DWM") as key:
+            raw = int(winreg.QueryValueEx(key, "AccentColor")[0])
+            return QColor(raw & 255, (raw >> 8) & 255, (raw >> 16) & 255)
+    except (OSError, ValueError, TypeError):
+        return QApplication.palette().color(QPalette.ColorRole.Highlight)
 
 
 def windows_system_dark_theme():
@@ -220,6 +238,71 @@ class RoundedTooltip(QLabel):
         painter.end()
 
 
+class IconSizeSlider(QSlider):
+    """Continuous 1px dragging; wheel jumps to adjacent standard icon size."""
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if not delta:
+            event.ignore()
+            return
+        direction = 1 if delta > 0 else -1
+        # Use the nearest standard size in the requested direction, not the
+        # nearest size overall. A partial wheel delta counts as one step.
+        for _ in range(max(1, abs(delta) // 120)):
+            current = self.value()
+            if direction > 0:
+                next_size = next((size for size in ICON_SIZES if size > current), ICON_SIZES[-1])
+            else:
+                next_size = next((size for size in reversed(ICON_SIZES) if size < current), ICON_SIZES[0])
+            self.setValue(next_size)
+        event.accept()
+
+
+class WindowsAppsLoader(QThread):
+    """Query Windows in a worker thread so the app picker opens immediately."""
+    loaded = Signal(object, object, str)
+
+    def run(self):
+        try:
+            script = (
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                "$a=@(Get-StartApps | Select-Object Name,AppID); "
+                "$p=@(Get-AppxPackage | Select-Object PackageFamilyName,InstallLocation); "
+                "@{Apps=$a;Packages=$p} | ConvertTo-Json -Depth 5 -Compress"
+            )
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True, text=True, encoding="utf-8-sig",
+                errors="replace", timeout=45,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode:
+                raise RuntimeError(proc.stderr.strip() or "Windows app query failed")
+            data = json.loads(proc.stdout)
+            apps = data.get("Apps") or []
+            packages = data.get("Packages") or []
+            if isinstance(apps, dict):
+                apps = [apps]
+            if isinstance(packages, dict):
+                packages = [packages]
+            result = sorted(
+                [(str(a.get("Name", "")).strip(), str(a.get("AppID", "")).strip())
+                 for a in apps if isinstance(a, dict) and a.get("Name") and a.get("AppID")],
+                key=lambda item: item[0].casefold())
+            roots = {}
+            for package in packages:
+                if not isinstance(package, dict):
+                    continue
+                family = package.get("PackageFamilyName")
+                folder = package.get("InstallLocation")
+                if family and folder:
+                    roots.setdefault(family, []).append(folder)
+            self.loaded.emit(result, roots, "")
+        except Exception as error:
+            self.loaded.emit([], {}, str(error))
+
+
 class ShortcutButton(QPushButton):
     def __init__(self, dock, path):
         super().__init__(dock.content)
@@ -248,19 +331,170 @@ class ShortcutButton(QPushButton):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(tint)
             painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
-        # Paint the QIcon through Qt itself. This preserves its actual icon
-        # engine (including Windows shell icons) and handles high-DPI scaling.
+        # Prefer an actual embedded ICO frame at its native dimensions.
+        # For intermediate sizes, scale the nearest suitable native frame.
         icon = self.icon()
         if not icon.isNull():
-            size = self.iconSize()
-            icon_rect = self.rect()
-            icon_rect.setLeft((self.width() - size.width()) // 2)
-            icon_rect.setTop((self.height() - size.height()) // 2)
-            icon_rect.setWidth(size.width())
-            icon_rect.setHeight(size.height())
-            icon.paint(painter, icon_rect, Qt.AlignmentFlag.AlignCenter,
-                       QIcon.Mode.Normal, QIcon.State.Off)
+            requested = self.iconSize().width()
+            source, native_size = self._icon_source_pixmap(requested)
+            if not source.isNull():
+                target = self.rect()
+                target.setLeft((self.width() - requested) // 2)
+                target.setTop((self.height() - requested) // 2)
+                target.setWidth(requested)
+                target.setHeight(requested)
+                # Preserve pixel-art crispness at exact integer enlargements.
+                # Otherwise use smooth interpolation for noninteger scaling.
+                integer_upscale = (native_size > 0 and requested >= native_size
+                                   and requested % native_size == 0)
+                if integer_upscale and requested > native_size:
+                    cache_key = (source.cacheKey(), requested)
+                    scaled = self._integer_cache.get(cache_key)
+                    if scaled is None:
+                        image = source.toImage()
+                        image.setDevicePixelRatio(1.0)
+                        image = image.scaled(
+                            requested, requested,
+                            Qt.AspectRatioMode.IgnoreAspectRatio,
+                            Qt.TransformationMode.FastTransformation)
+                        scaled = QPixmap.fromImage(image)
+                        self._integer_cache[cache_key] = scaled
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+                    painter.drawPixmap(target.topLeft(), scaled)
+                else:
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                                          not integer_upscale)
+                    painter.drawPixmap(target, source, source.rect())
         painter.end()
+
+    def drag_icon_pixmap(self):
+        """Draw the exact same pixels as the dock icon, without the hover tile."""
+        requested = self.iconSize().width()
+        result = QPixmap(requested, requested)
+        result.fill(Qt.GlobalColor.transparent)
+        source, native = self._icon_source_pixmap(requested)
+        if source.isNull():
+            return result
+        painter = QPainter(result)
+        integer = native > 0 and requested > native and requested % native == 0
+        if integer:
+            key = (source.cacheKey(), requested)
+            scaled = self._integer_cache.get(key)
+            if scaled is None:
+                image = source.toImage()
+                image.setDevicePixelRatio(1.0)
+                scaled = QPixmap.fromImage(image.scaled(
+                    requested, requested, Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation))
+                self._integer_cache[key] = scaled
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawPixmap(QPoint(0, 0), scaled)
+        else:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawPixmap(QRect(0, 0, requested, requested), source, source.rect())
+        painter.end()
+        return result
+
+    def _icon_source_pixmap(self, requested):
+        icon = self.icon()
+        key = icon.cacheKey()
+        if getattr(self, "_source_icon_key", None) != key:
+            self._source_icon_key = key
+            self._source_pixmaps = {}
+            self._trim_cache = {}
+            self._integer_cache = {}
+            self._native_sizes = sorted({sz.width() for sz in icon.availableSizes()
+                                         if sz.width() == sz.height() and sz.width() > 0})
+
+        sizes = self._native_sizes
+        if sizes:
+            # Use the exact frame when present; for in-between sizes prefer
+            # downscaling a larger frame, except above the largest native frame.
+            if requested in sizes:
+                native = requested
+            else:
+                integer_sources = [n for n in sizes if n < requested and requested % n == 0]
+                native = max(integer_sources) if integer_sources else next(
+                    (n for n in sizes if n >= requested), sizes[-1])
+        else:
+            # Shell icon engines may not advertise their actual ICO sizes.
+            # Request the current dimension directly instead of stretching a
+            # single 256px image across every possible size.
+            native = requested
+        if native not in self._source_pixmaps:
+            self._source_pixmaps[native] = icon.pixmap(QSize(native, native))
+        pixmap = self._source_pixmaps[native]
+        actual = round(pixmap.width() / max(1.0, pixmap.devicePixelRatio()))
+        # The Windows shell icon engine sometimes returns a 16px bitmap even
+        # when asked for 32px or more. In that case prefer the largest cached
+        # *real* bitmap, rather than repeatedly enlarging a tiny fallback.
+        if not sizes and actual < requested:
+            for probe in (256, 128, 96, 64, 48, 32):
+                if probe <= actual:
+                    break
+                if probe not in self._source_pixmaps:
+                    self._source_pixmaps[probe] = icon.pixmap(QSize(probe, probe))
+                candidate = self._source_pixmaps[probe]
+                candidate_size = round(candidate.width() / max(1.0, candidate.devicePixelRatio()))
+                if candidate_size > actual:
+                    pixmap, actual = candidate, candidate_size
+                    break
+        # Some Windows icon engines return a 256px canvas containing only a
+        # 16/32px picture. Crop the empty padding rather than scaling the canvas.
+        # Keep this cached: scanning pixels during every paint causes flicker.
+        cache_key = (native, pixmap.cacheKey())
+        if cache_key not in self._trim_cache:
+            trimmed_pixmap = pixmap
+            if not pixmap.isNull() and pixmap.width() >= 48:
+                image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+                left, top = image.width(), image.height()
+                right = bottom = -1
+                for y in range(image.height()):
+                    for x in range(image.width()):
+                        if (image.pixel(x, y) >> 24) & 255 >= 16:
+                            left = min(left, x)
+                            top = min(top, y)
+                            right = max(right, x)
+                            bottom = max(bottom, y)
+                if right >= left and bottom >= top:
+                    width, height = right - left + 1, bottom - top + 1
+                    if max(width, height) <= max(image.width(), image.height()) * .62:
+                        # Center the actual graphic in a square transparent canvas.
+                        side = max(width, height)
+                        crop = pixmap.copy(left, top, width, height)
+                        square = QPixmap(side, side)
+                        square.fill(Qt.GlobalColor.transparent)
+                        cp = QPainter(square)
+                        cp.drawPixmap((side - width)//2, (side - height)//2, crop)
+                        cp.end()
+                        trimmed_pixmap = square
+            self._trim_cache[cache_key] = trimmed_pixmap
+        pixmap = self._trim_cache[cache_key]
+        actual = round(pixmap.width() / max(1.0, pixmap.devicePixelRatio()))
+        return pixmap, (native if sizes and pixmap is self._source_pixmaps.get(native) else actual)
+
+    def prepare_icon_frames(self):
+        """Warm icon and integer-size caches outside resize/paint callbacks."""
+        if self.icon().isNull():
+            return
+        # Accessing the native representations once also caches expensive
+        # transparent-border detection for each frame.
+        self._icon_source_pixmap(self.iconSize().width())
+        native_sizes = list(self._native_sizes)
+        for native in native_sizes:
+            self._icon_source_pixmap(native)
+        for requested in ICON_SIZES:
+            source, native = self._icon_source_pixmap(requested)
+            if source.isNull() or native <= 0 or requested <= native or requested % native:
+                continue
+            key = (source.cacheKey(), requested)
+            if key not in self._integer_cache:
+                image = source.toImage()
+                image.setDevicePixelRatio(1.0)
+                image = image.scaled(requested, requested,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation)
+                self._integer_cache[key] = QPixmap.fromImage(image)
 
     def enterEvent(self, event):
         self.update()
@@ -295,8 +529,14 @@ class ShortcutButton(QPushButton):
         menu = QMenu(self)
         style_icon_context_menu(menu)
         open_action = menu.addAction("Open")
+        location_action = menu.addAction("Open file location")
         rename_action = menu.addAction("Rename")
+        windows_apps_action = menu.addAction("Add Windows app...")
         remove_action = menu.addAction("Remove from Dock")
+        menu.addSeparator()
+        add_separator_action = menu.addAction("Add separator")
+        menu.addSeparator()
+        exit_action = menu.addAction("Exit dock")
         self.dock.icon_menu_open = True
         self.dock.hide_deadline = None
         try:
@@ -324,12 +564,22 @@ class ShortcutButton(QPushButton):
         finally:
             self.dock.icon_menu_open = False
             self.dock.hide_deadline = None
+        if selected in (rename_action, add_separator_action):
+            self.dock.allow_context_return()
         if selected == open_action:
             self.dock.launch_shortcut(self.path)
+        elif selected == location_action:
+            self.dock.open_file_location(self.path)
         elif selected == rename_action:
             self.dock.rename_shortcut(self.path)
+        elif selected == windows_apps_action:
+            self.dock.browse_windows_apps()
         elif selected == remove_action:
             self.dock.remove_shortcut(self.path)
+        elif selected == add_separator_action:
+            self.dock.add_separator(self.path)
+        elif selected == exit_action:
+            QApplication.instance().quit()
 
     def dragEnterEvent(self, event):
         self.dock.handle_drag_hover(event, self)
@@ -342,6 +592,60 @@ class ShortcutButton(QPushButton):
 
     def dropEvent(self, event):
         self.dock.handle_drop(event, self)
+
+
+class SeparatorButton(ShortcutButton):
+    """A movable, persistent visual spacer; never exported to Explorer."""
+    def __init__(self, dock, path):
+        super().__init__(dock, path)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        dark = windows_system_dark_theme()
+        if self.underMouse() or self.isDown():
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255,255,255,28) if dark else QColor(0,0,0,18))
+            painter.drawRoundedRect(self.rect().adjusted(2,2,-2,-2), 5, 5)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255,255,255,95) if dark else QColor(0,0,0,85))
+        if self.dock.position in ("Top", "Bottom"):
+            painter.drawRoundedRect((self.width()-2)//2, self.height()//4, 2, self.height()//2, 1, 1)
+        else:
+            painter.drawRoundedRect(self.width()//4, (self.height()-2)//2, self.width()//2, 2, 1, 1)
+        painter.end()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        style_icon_context_menu(menu)
+        add = menu.addAction("Add separator")
+        remove = menu.addAction("Remove separator")
+        windows_apps_action = menu.addAction("Add Windows app...")
+        menu.addSeparator()
+        exit_action = menu.addAction("Exit dock")
+        self.dock.icon_menu_open = True
+        self.dock.hide_deadline = None
+        try:
+            pos = self.mapToGlobal(event.pos())
+            selected = menu.exec(pos)
+        finally:
+            self.dock.icon_menu_open = False
+            self.dock.hide_deadline = None
+        if selected in (add, remove):
+            self.dock.allow_context_return()
+        if selected == add:
+            self.dock.add_separator(self.path)
+        elif selected == remove:
+            self.dock.remove_separator(self.path)
+        elif selected == windows_apps_action:
+            self.dock.browse_windows_apps()
+        elif selected == exit_action:
+            QApplication.instance().quit()
+
+    def mouseMoveEvent(self, event):
+        # The same internal gap animation, but never an Explorer drag.
+        super().mouseMoveEvent(event)
 
 
 class ShortcutsDock(QWidget):
@@ -367,11 +671,18 @@ class ShortcutsDock(QWidget):
 
         self.offset = max(0, min(200, int(self.settings.value("offset", 0))))
         self.icon_spacing = max(0, min(40, int(self.settings.value("icon_spacing", SPACING))))
+        saved_icon_size = int(self.settings.value("icon_size", ICON_SIZE))
+        self.icon_size = max(ICON_SIZES[0], min(ICON_SIZES[-1], saved_icon_size))
+        self.button_size = self.icon_size + 16
+        self.separator_distance = max(0, min(100, int(self.settings.value("separator_distance", 12))))
+        self._rendered_icon_size = self.icon_size
+        self._center_overflow_on_resize = True
         self.reverse_scroll = self.settings.value("reverse_scroll", False, type=bool)
 
         self.auto_hide = self.settings.value("auto_hide", False, type=bool)
         self.hide_delay = max(0, min(3000, int(self.settings.value("hide_delay", 500))))
         self.hide_deadline = None
+        self.context_grace_until = 0.0
         self.appearance_delay = max(0, min(3000, int(self.settings.value("appearance_delay", 0))))
         self.appearance_since = None
         self.dragging = False
@@ -406,6 +717,13 @@ class ShortcutsDock(QWidget):
         self.animation.setDuration(230)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.animation.finished.connect(self.animation_finished)
+        # A single interruptible animation interpolates the rendered size.
+        # The slider stores its exact requested value independently.
+        self.size_animation = QVariantAnimation(self)
+        self.size_animation.setDuration(115)
+        self.size_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.size_animation.valueChanged.connect(self.render_icon_size)
+        self.size_animation.finished.connect(lambda: self.render_icon_size(self.icon_size))
         self.animation_hiding = False
         self.visible_position = QPoint(0, 0)
 
@@ -546,6 +864,14 @@ class ShortcutsDock(QWidget):
 
             icon_location = link.IconLocation
             target_path = link.TargetPath
+            arguments = str(link.Arguments or "")
+            if "shell:AppsFolder" in arguments and not (
+                    icon_location and Path(
+                        os.path.expandvars(icon_location.rsplit(",", 1)[0].strip('"'))
+                    ).is_file()):
+                app_id = arguments.split("shell:AppsFolder", 1)[1].lstrip("\\\\/")
+                if app_id:
+                    return self.windows_app_icon(app_id, shortcut.stem)
 
             # Use the shortcut's custom icon file when available.
             if icon_location:
@@ -553,6 +879,14 @@ class ShortcutsDock(QWidget):
                     icon_location.rsplit(",", 1)[0].strip('"')
                 )
                 if os.path.isfile(icon_path):
+                    # QFileIconProvider returns a Windows shell icon, which may
+                    # substitute a 16px representation for 32px at large sizes.
+                    # Read .ico files directly so Qt can select their actual
+                    # embedded 16/32/48/256px frames instead.
+                    if Path(icon_path).suffix.lower() == ".ico":
+                        icon = QIcon(icon_path)
+                        if not icon.isNull():
+                            return icon
                     icon = self.icon_provider.icon(QFileInfo(icon_path))
                     if not icon.isNull():
                         return icon
@@ -568,6 +902,10 @@ class ShortcutsDock(QWidget):
                 if os.path.isdir(target_path):
                     return self.icon_provider.icon(QFileInfo(target_path))
                 if os.path.isfile(target_path):
+                    if Path(target_path).suffix.lower() == ".ico":
+                        icon = QIcon(target_path)
+                        if not icon.isNull():
+                            return icon
                     icon = self.icon_provider.icon(QFileInfo(target_path))
                     if not icon.isNull():
                         return icon
@@ -583,7 +921,7 @@ class ShortcutsDock(QWidget):
 
     def shortcut_paths(self):
         files = [p for p in SHORTCUTS_DIR.iterdir()
-                 if p.is_file() and p.suffix.lower() == ".lnk"]
+                 if p.is_file() and p.suffix.lower() in (".lnk", SEPARATOR_SUFFIX)]
         try:
             order = json.loads(self.settings.value("shortcut_order", "[]"))
             if not isinstance(order, list):
@@ -597,7 +935,7 @@ class ShortcutsDock(QWidget):
 
     def check_shortcuts_folder(self):
         current = {p.name.casefold() for p in SHORTCUTS_DIR.iterdir()
-                   if p.is_file() and p.suffix.lower() == ".lnk"}
+                   if p.is_file() and p.suffix.lower() in (".lnk", SEPARATOR_SUFFIX)}
         if current == self.known_shortcut_names or self.dragging or self.icon_menu_open:
             return
         # Compact the stored order when a shortcut disappears, and append
@@ -682,6 +1020,38 @@ class ShortcutsDock(QWidget):
     def save_order(self, paths):
         self.settings.setValue("shortcut_order", json.dumps([p.name for p in paths]))
 
+    def allow_context_return(self, seconds=1.5):
+        """Keep the dock visible briefly after a context-menu operation."""
+        self.context_grace_until = max(self.context_grace_until, time.monotonic() + seconds)
+        self.hide_deadline = None
+
+    def add_separator(self, after=None):
+        """Create a real marker file so separators survive restarts/reordering."""
+        path = SHORTCUTS_DIR / ("separator-" + uuid.uuid4().hex + SEPARATOR_SUFFIX)
+        path.touch()
+        order = [p for p in self.shortcut_paths() if p != path]
+        if after in order:
+            order.insert(order.index(after) + 1, path)
+        else:
+            order.append(path)
+        self.save_order(order)
+        self.load_shortcuts()
+        self.allow_context_return()
+
+    def remove_separator(self, path):
+        if path.suffix.lower() != SEPARATOR_SUFFIX:
+            return
+        try:
+            path.unlink()
+        except OSError as error:
+            QMessageBox.warning(self, "Remove Separator", str(error))
+            return
+        self.save_order([p for p in self.shortcut_paths() if p != path])
+        self.load_shortcuts()
+        self._center_overflow_on_resize = True
+        self.update_orientation()
+        self.allow_context_return()
+
     def load_shortcuts(self):
         while self.layout.count():
             item = self.layout.takeAt(0)
@@ -693,21 +1063,31 @@ class ShortcutsDock(QWidget):
         if not shortcuts:
             button = QPushButton("+")
             button.setToolTip("Drag files, folders, or shortcuts onto the dock")
-            button.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
+            button.setFixedSize(self.button_size, self.button_size)
             button.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self.layout.addWidget(button)
 
         for shortcut in shortcuts:
-            button = ShortcutButton(self, shortcut)
+            is_separator = shortcut.suffix.lower() == SEPARATOR_SUFFIX
+            button = SeparatorButton(self, shortcut) if is_separator else ShortcutButton(self, shortcut)
             button.installEventFilter(self)
-            button.setIcon(self.get_shortcut_icon(shortcut))
-            button.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
-            button.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
+            if not is_separator:
+                button.setIcon(self.get_shortcut_icon(shortcut))
+            button.setIconSize(QSize(self.icon_size, self.icon_size))
+            if is_separator:
+                self.size_separator(button)
+            else:
+                button.setFixedSize(self.button_size, self.button_size)
             button.setToolTip("")
-            button.clicked.connect(lambda checked=False, path=shortcut:
-                                   self.launch_shortcut(path))
+            if not is_separator:
+                button.clicked.connect(lambda checked=False, path=shortcut:
+                                       self.launch_shortcut(path))
             self.layout.addWidget(button)
+            if isinstance(button, ShortcutButton):
+                QTimer.singleShot(0, button.prepare_icon_frames)
+        self._center_overflow_on_resize = True
         self.update_orientation()
+        self._reset_scroll_for_fitting_content()
         self.known_shortcut_names = {p.name.casefold() for p in shortcuts}
 
     def unique_path(self, folder, stem, suffix=".lnk"):
@@ -840,7 +1220,7 @@ class ShortcutsDock(QWidget):
             ok = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self.rename_dialog_open = False
-            self.hide_deadline = None
+            self.allow_context_return()
             self.appearance_since = None
         name = editor.text()
         if not ok or not name.strip():
@@ -864,10 +1244,90 @@ class ShortcutsDock(QWidget):
     def remove_shortcut(self, path):
         try:
             path.unlink()
-            self.save_order([p for p in self.shortcut_paths() if p != path])
-            self.load_shortcuts()
         except OSError as error:
             QMessageBox.warning(self, "Remove Shortcut", str(error))
+            return
+        order = [p for p in self.shortcut_paths() if p != path]
+        self.save_order(order)
+        self.known_shortcut_names = {p.name.casefold() for p in order
+                                     if p.suffix.lower() == ".lnk"}
+        removed = next(
+            (self.layout.itemAt(i).widget() for i in range(self.layout.count())
+             if isinstance(self.layout.itemAt(i).widget(), ShortcutButton)
+             and self.layout.itemAt(i).widget().path == path), None)
+        if removed is None:
+            self.load_shortcuts()
+            self.allow_context_return()
+            return
+
+        # Build the final layout geometry while the OLD viewport is still
+        # wide enough to contain the final icon. Qt must not paint a resized
+        # viewport against the stale layout/scroll offset.
+        self.setUpdatesEnabled(False)
+        self.scroll_area.setUpdatesEnabled(False)
+        self.content.setUpdatesEnabled(False)
+        try:
+            self.clear_icon_tooltip()
+            for animation in self.push_animations:
+                animation.stop()
+            self.push_animations.clear()
+            self.layout.removeWidget(removed)
+            removed.hide()
+            removed.deleteLater()
+            if not order:
+                self.load_shortcuts()
+            else:
+                horizontal = self.position in ("Bottom", "Top")
+                count = self.layout.count()
+                thickness = MARGIN * 2 + self.button_size
+                length = MARGIN * 2 + max(0, count - 1) * self.icon_spacing
+                for i in range(count):
+                    widget = self.layout.itemAt(i).widget()
+                    if isinstance(widget, SeparatorButton):
+                        self.size_separator(widget)
+                    length += ((widget.width() if horizontal else widget.height())
+                               if widget else self.button_size)
+
+                # Reset the old scroll position BEFORE changing the viewport.
+                self.scroll_area.horizontalScrollBar().setValue(0)
+                self.scroll_area.verticalScrollBar().setValue(0)
+                self.content.move(0, 0)
+                self.content.setFixedSize(
+                    length if horizontal else thickness,
+                    thickness if horizontal else length)
+                self.layout.invalidate()
+                self.layout.activate()
+                self.layout.setGeometry(self.content.rect())
+
+                screen = self.get_target_screen()
+                if screen:
+                    available = screen.availableGeometry()
+                    limit = available.width() if horizontal else available.height()
+                else:
+                    limit = length
+                visible = min(length, max(thickness, limit))
+                width, height = ((visible, thickness) if horizontal
+                                 else (thickness, visible))
+                self.set_dock_geometry(width, height, screen)
+                self.panel.setGeometry(0, 0, width, height)
+                self.scroll_area.setGeometry(0, 0, width, height)
+
+                if length > limit:
+                    # Only genuinely oversized docks need scrolling.
+                    bar = (self.scroll_area.horizontalScrollBar() if horizontal
+                           else self.scroll_area.verticalScrollBar())
+                    bar.setValue((bar.minimum() + bar.maximum()) // 2)
+                else:
+                    self.scroll_area.horizontalScrollBar().setValue(0)
+                    self.scroll_area.verticalScrollBar().setValue(0)
+                    self.content.move(0, 0)
+                self._center_overflow_on_resize = False
+        finally:
+            self.content.setUpdatesEnabled(True)
+            self.scroll_area.setUpdatesEnabled(True)
+            self.setUpdatesEnabled(True)
+            self.update()
+        self.allow_context_return()
 
     def animate_icon_layout(self, change):
         """Animate surviving icons between their old and new layout positions."""
@@ -921,7 +1381,7 @@ class ShortcutsDock(QWidget):
         self.internal_drop = False
         index = self.layout.indexOf(button)
         gap = QWidget(self.content)
-        gap.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
+        gap.setFixedSize(self.button_size, self.button_size)
         gap.setStyleSheet("background: transparent; border: none;")
         self.drag_placeholder = gap
         self.drag_preview_index = index
@@ -933,10 +1393,23 @@ class ShortcutsDock(QWidget):
         drag = QDrag(button)
         mime = QMimeData()
         mime.setData(MIME_DOCK, str(button.path).encode("utf-8"))
-        mime.setUrls([QUrl.fromLocalFile(str(button.path))])
+        if not isinstance(button, SeparatorButton):
+            mime.setUrls([QUrl.fromLocalFile(str(button.path))])
         drag.setMimeData(mime)
-        drag.setPixmap(button.icon().pixmap(QSize(ICON_SIZE, ICON_SIZE)))
-        drag.setHotSpot(QPoint(ICON_SIZE // 2, ICON_SIZE // 2))
+        if isinstance(button, SeparatorButton):
+            pix = QPixmap(self.button_size, self.button_size)
+            pix.fill(Qt.GlobalColor.transparent)
+            pp = QPainter(pix)
+            pp.setPen(QPen(QColor(150, 150, 150), 2))
+            if self.position in ("Bottom", "Top"):
+                pp.drawLine(self.button_size//2, 8, self.button_size//2, self.button_size-8)
+            else:
+                pp.drawLine(8, self.button_size//2, self.button_size-8, self.button_size//2)
+            pp.end()
+            drag.setPixmap(pix)
+        else:
+            drag.setPixmap(button.drag_icon_pixmap())
+        drag.setHotSpot(QPoint(drag.pixmap().width() // 2, drag.pixmap().height() // 2))
         # Override Qt/Windows drag-operation badge. The floating icon itself
         # is already drawn by setPixmap; no additional '+' cursor is needed.
         clean_cursor = QPixmap(1, 1)
@@ -960,7 +1433,7 @@ class ShortcutsDock(QWidget):
         gap.hide()
         gap.deleteLater()
         self.drag_placeholder = None
-        was_internal = self.internal_drop
+        was_internal = self.internal_drop or isinstance(button, SeparatorButton)
         self.internal_drop = False
         self.dragging = False
         self.drag_button = None
@@ -1007,8 +1480,12 @@ class ShortcutsDock(QWidget):
         global_pos = QCursor.pos()
         local = self.content.mapFromGlobal(global_pos)
         if not self.content.rect().contains(local):
-            self.move_drag_gap(-1)
-            return
+            if isinstance(self.drag_button, SeparatorButton):
+                local.setX(max(0, min(local.x(), self.content.width()-1)))
+                local.setY(max(0, min(local.y(), self.content.height()-1)))
+            else:
+                self.move_drag_gap(-1)
+                return
         horizontal = self.position in ("Bottom", "Top")
         coord = local.x() if horizontal else local.y()
         buttons = [self.layout.itemAt(i).widget() for i in range(self.layout.count())
@@ -1032,7 +1509,7 @@ class ShortcutsDock(QWidget):
         self.hide_deadline = None
         if self.drag_placeholder is None:
             gap = QWidget(self.content)
-            gap.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
+            gap.setFixedSize(self.button_size, self.button_size)
             gap.setStyleSheet("background: transparent; border: none;")
             self.drag_placeholder = gap
         # Drag events may be delivered to a different child as the insertion
@@ -1093,7 +1570,7 @@ class ShortcutsDock(QWidget):
 
     def eventFilter(self, obj, event):
         if isinstance(obj, ShortcutButton):
-            if event.type() == QEvent.Type.Enter:
+            if event.type() == QEvent.Type.Enter and not isinstance(obj, SeparatorButton):
                 self.update_icon_tooltip(obj)
             elif event.type() == QEvent.Type.Leave:
                 if self.tooltip_button is obj:
@@ -1133,7 +1610,7 @@ class ShortcutsDock(QWidget):
             direction *= -1
         # One wheel notch = one icon pitch (icon + its spacing).
         # Snap to the icon grid instead of accumulating arbitrary pixel offsets.
-        pitch = BUTTON_SIZE + self.icon_spacing
+        pitch = self.button_size + self.icon_spacing
         steps = max(1, round(abs(delta) / 120))
         current = bar.value()
         # Snap instantly to the next whole icon.
@@ -1144,6 +1621,69 @@ class ShortcutsDock(QWidget):
         target = max(bar.minimum(), min(bar.maximum(), index * pitch))
         bar.setValue(target)
         self.hide_deadline = None
+
+    def change_icon_size(self, new_size):
+        new_size = max(ICON_SIZES[0], min(ICON_SIZES[-1], int(new_size)))
+        if new_size == self.icon_size:
+            return
+        self.icon_size = new_size
+        self.settings.setValue("icon_size", new_size)
+        self.icon_size_label.setText(f"Icon size: {new_size} × {new_size} px")
+
+        # A dragged slider already delivers a continuous 1px stream. Animating
+        # every single change restarts easing 60+ times a second and creates the
+        # lag/jump seen in the recording. Render those changes directly.
+        slider = self.sender()
+        self.size_animation.stop()
+        if isinstance(slider, QSlider) and slider.isSliderDown():
+            self.render_icon_size(new_size)
+        else:
+            # Wheel/keyboard steps are discrete; interpolate between them.
+            self.size_animation.setStartValue(float(self._rendered_icon_size))
+            self.size_animation.setEndValue(float(new_size))
+            self.size_animation.start()
+
+    def render_icon_size(self, value):
+        size = max(ICON_SIZES[0], min(ICON_SIZES[-1], round(float(value))))
+        if size == self._rendered_icon_size:
+            return
+        self._rendered_icon_size = size
+        self._center_overflow_on_resize = True
+        self.button_size = size + 16
+        self.setUpdatesEnabled(False)
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if widget is not None:
+                if isinstance(widget, ShortcutButton):
+                    widget.setIconSize(QSize(size, size))
+                if isinstance(widget, SeparatorButton):
+                    self.size_separator(widget)
+                else:
+                    widget.setFixedSize(self.button_size, self.button_size)
+        try:
+            self.update_orientation()
+        finally:
+            self.setUpdatesEnabled(True)
+            self.update()
+
+    def size_separator(self, widget):
+        # Distance is the free space on each side of the divider line.
+        axis = max(8, 8 + 2 * self.separator_distance)
+        if self.position in ("Top", "Bottom"):
+            widget.setFixedSize(axis, self.button_size)
+        else:
+            widget.setFixedSize(self.button_size, axis)
+
+    def change_separator_distance(self, value):
+        self.separator_distance = int(value)
+        self.settings.setValue("separator_distance", self.separator_distance)
+        self.separator_distance_label.setText(
+            f"Separator distance: {self.separator_distance} px each side")
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if isinstance(widget, SeparatorButton):
+                self.size_separator(widget)
+        self.update_orientation()
 
     def change_spacing(self, value):
         self.icon_spacing = value
@@ -1200,6 +1740,29 @@ class ShortcutsDock(QWidget):
                 return
         event.ignore()
 
+    def open_file_location(self, shortcut):
+        """Open the actual shortcut target's working folder, never the dock folder."""
+        try:
+            link = win32com.client.Dispatch("WScript.Shell").CreateShortcut(str(shortcut))
+            working = os.path.expandvars(str(link.WorkingDirectory or "").strip('" '))
+            target = os.path.expandvars(str(link.TargetPath or "").strip('" '))
+            # For shortcuts to Explorer, the arguments usually specify the
+            # actual directory; the target executable is just explorer.exe.
+            arguments = str(link.Arguments or "").strip()
+            if target and Path(target).name.lower() == "explorer.exe" and arguments:
+                candidate = os.path.expandvars(arguments.strip('" '))
+                if Path(candidate).is_dir():
+                    working = candidate
+            if working and Path(working).is_dir():
+                folder = Path(working)
+            elif target and Path(target).exists():
+                folder = Path(target) if Path(target).is_dir() else Path(target).parent
+            else:
+                raise FileNotFoundError("The shortcut target or working directory could not be found.")
+            os.startfile(str(folder))
+        except Exception as error:
+            QMessageBox.warning(self, "Open file location", str(error))
+
     def launch_shortcut(self, shortcut):
         try:
             os.startfile(str(shortcut))
@@ -1211,13 +1774,62 @@ class ShortcutsDock(QWidget):
                 f"{shortcut}\n\n{error}"
             )
 
+    def settle_dock_layout(self):
+        """Synchronize actual scroll-widget position with the new dock width."""
+        self.layout.invalidate()
+        self.layout.activate()
+        self.update_orientation()
+        self._reset_scroll_for_fitting_content()
+
+    def _reset_scroll_for_fitting_content(self):
+        """A dock that fits on screen must start at the FIRST icon.
+
+        QScrollArea may retain the previous horizontal scroll offset after a
+        shortcut is removed, even after the viewport has been made smaller.
+        That makes the rightmost surviving shortcut appear cut off.
+        """
+        horizontal = self.position in ("Bottom", "Top")
+        bar = (self.scroll_area.horizontalScrollBar() if horizontal
+               else self.scroll_area.verticalScrollBar())
+        screen = self.get_target_screen()
+        available = screen.availableGeometry() if screen else None
+        available_length = ((available.width() if horizontal else available.height())
+                            if available else 0)
+        actual_length = (self.content.width() if horizontal else self.content.height())
+        if not available or actual_length <= available_length:
+            # No overflow: Qt must not preserve a scroll offset from the
+            # previous, longer dock. Explicitly reset the widget position.
+            bar.setValue(0)
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
+        else:
+            bar.setValue((bar.minimum() + bar.maximum()) // 2)
+        self.scroll_area.viewport().update()
+
+    def schedule_dock_layout_settle(self):
+        """Repair once Qt and the 145ms icon animation have both settled."""
+        self._layout_settle_serial = getattr(self, "_layout_settle_serial", 0) + 1
+        serial = self._layout_settle_serial
+
+        def settle():
+            if serial == self._layout_settle_serial:
+                self.settle_dock_layout()
+
+        QTimer.singleShot(0, settle)
+        QTimer.singleShot(180, settle)
+
     def update_orientation(self):
         horizontal = self.position in ("Bottom", "Top")
         self.layout.setDirection(QBoxLayout.Direction.LeftToRight if horizontal
                                  else QBoxLayout.Direction.TopToBottom)
         count = max(1, self.layout.count())
-        length = MARGIN * 2 + count * BUTTON_SIZE + (count - 1) * self.icon_spacing
-        thickness = MARGIN * 2 + BUTTON_SIZE
+        length = MARGIN * 2 + (count - 1) * self.icon_spacing
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if isinstance(widget, SeparatorButton):
+                self.size_separator(widget)
+            length += (widget.width() if horizontal else widget.height()) if widget else self.button_size
+        thickness = MARGIN * 2 + self.button_size
         screen = self.get_target_screen()
         if screen is not None:
             available = screen.availableGeometry()
@@ -1229,17 +1841,33 @@ class ShortcutsDock(QWidget):
                          else (thickness, visible_length))
         old_horizontal = self.scroll_area.horizontalScrollBar().value()
         old_vertical = self.scroll_area.verticalScrollBar().value()
-        self.setFixedSize(width, height)
+        # Resize and reposition in ONE geometry operation. Resizing first and
+        # moving later makes Windows display an intermediate corner-anchored
+        # frame, perceived as a jump at high DPI.
+        self.set_dock_geometry(width, height, screen)
         self.panel.setGeometry(0, 0, width, height)
         self.scroll_area.setGeometry(0, 0, width, height)
         self.content.setFixedSize(length if horizontal else thickness,
                                   thickness if horizontal else length)
+        self.layout.invalidate()
         self.layout.activate()
-        if horizontal:
+        # The viewport is clipped at the screen size. When resizing, center
+        # the entire icon strip under it so BOTH ends overflow equally.
+        if self._center_overflow_on_resize:
+            bar = (self.scroll_area.horizontalScrollBar() if horizontal
+                   else self.scroll_area.verticalScrollBar())
+            bar.setValue((bar.minimum() + bar.maximum()) // 2)
+            self._center_overflow_on_resize = False
+        elif horizontal:
             self.scroll_area.horizontalScrollBar().setValue(old_horizontal)
         else:
             self.scroll_area.verticalScrollBar().setValue(old_vertical)
-        self.position_dock()
+        # A reduced dock may still have the previous scroll position.
+        # Force the first icon to x=0 when the entire strip fits.
+        if length <= max_length:
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
+        # set_dock_geometry already applied the correct anchored position.
 
     def get_target_screen(self):
         if self.primary_only:
@@ -1251,47 +1879,43 @@ class ShortcutsDock(QWidget):
 
         return screen or QApplication.primaryScreen()
 
+    def anchored_position(self, screen, width, height):
+        geometry = screen.availableGeometry()
+        if self.position == "Bottom":
+            return QPoint(geometry.x() + (geometry.width() - width) // 2,
+                          geometry.bottom() - height + 1 - self.offset)
+        if self.position == "Top":
+            return QPoint(geometry.x() + (geometry.width() - width) // 2,
+                          geometry.top() + self.offset)
+        if self.position == "Left":
+            return QPoint(geometry.left() + self.offset,
+                          geometry.y() + (geometry.height() - height) // 2)
+        return QPoint(geometry.right() - width + 1 - self.offset,
+                      geometry.y() + (geometry.height() - height) // 2)
+
+    def set_dock_geometry(self, width, height, screen=None):
+        screen = screen or self.get_target_screen()
+        if screen is None:
+            self.resize(width, height)
+            return
+        self.current_screen = screen
+        position = self.anchored_position(screen, width, height)
+        self.visible_position = position
+        if not self.animating:
+            # QWindow geometry is committed together: center stays fixed and
+            # the edge facing the taskbar never shifts during a size frame.
+            if self.geometry() != QRect(position.x(), position.y(), width, height):
+                self.setGeometry(position.x(), position.y(), width, height)
+        else:
+            # Do not override the active auto-hide/show slide position.
+            self.resize(width, height)
+
     def position_dock(self, screen=None):
         screen = screen or self.get_target_screen()
-
         if screen is None:
             return
-
         self.current_screen = screen
-
-        # availableGeometry excludes the Windows
-        # taskbar's reserved area.
-        geometry = screen.availableGeometry()
-
-        if self.position == "Bottom":
-            x = (
-                geometry.x()
-                + (geometry.width() - self.width()) // 2
-            )
-            y = geometry.bottom() - self.height() + 1 - self.offset
-
-        elif self.position == "Top":
-            x = (
-                geometry.x()
-                + (geometry.width() - self.width()) // 2
-            )
-            y = geometry.top() + self.offset
-
-        elif self.position == "Left":
-            x = geometry.left() + self.offset
-            y = (
-                geometry.y()
-                + (geometry.height() - self.height()) // 2
-            )
-
-        else:  # Right
-            x = geometry.right() - self.width() + 1 - self.offset
-            y = (
-                geometry.y()
-                + (geometry.height() - self.height()) // 2
-            )
-
-        self.visible_position = QPoint(x, y)
+        self.visible_position = self.anchored_position(screen, self.width(), self.height())
         if not self.animating and (self.isVisible() or not self.auto_hide):
             self.move(self.visible_position)
 
@@ -1465,7 +2089,8 @@ class ShortcutsDock(QWidget):
             return
 
         zone = self.in_activation_zone(cursor, screen)
-        if self.dragging or self.icon_menu_open or self.tray_menu_open or self.rename_dialog_open:
+        if (self.dragging or self.icon_menu_open or self.tray_menu_open
+                or self.rename_dialog_open or time.monotonic() < self.context_grace_until):
             self.hide_deadline = None
             return
         if self.animating:
@@ -1543,6 +2168,8 @@ class ShortcutsDock(QWidget):
             "position", position
         )
         self.update_orientation()
+        # Crossing the screen to another edge needs more time.
+        self.allow_context_return(3.0)
 
     def change_monitor_mode(self, primary_only):
         self.primary_only = primary_only
@@ -1585,7 +2212,7 @@ class ShortcutsDock(QWidget):
         """Keep embedded QWidgetAction labels readable in the Windows theme."""
         foreground = "#f5f5f5" if windows_system_dark_theme() else "#202020"
         for label in (self.delay_label, self.appearance_label,
-                      self.spacing_label, self.offset_label):
+                      self.spacing_label, self.icon_size_label, self.separator_distance_label, self.offset_label):
             label.setStyleSheet(f"QLabel {{ color: {foreground}; background: transparent; }}")
 
     def style_menu_slider(self, slider):
@@ -1640,7 +2267,14 @@ class ShortcutsDock(QWidget):
         github = QLabel('<a href="https://github.com/packetlauncher">github.com/packetlauncher</a>')
         github.setOpenExternalLinks(True)
         github.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        github.setStyleSheet("QLabel { color: #4da3ff; background: transparent; }")
+        # Windows' system hyperlink/accent color is exposed through the
+        # current Qt application palette. Apply it to the anchor itself:
+        # styling QLabel alone does not override HTML <a> colors.
+        link_color = windows_accent_color().name()
+        github.setText(
+            f'<a href="https://github.com/packetlauncher" '
+            f'style="color: {link_color};">github.com/packetlauncher</a>')
+        github.setStyleSheet("QLabel { background: transparent; }")
         outer.addWidget(github)
         outer.addSpacing(5)
         ok = QPushButton("OK")
@@ -1656,6 +2290,270 @@ class ShortcutsDock(QWidget):
         finally:
             self.rename_dialog_open = False
             self.hide_deadline = None
+
+    def contextMenuEvent(self, event):
+        # Right-click the empty dock surface to add an installed app.
+        menu = QMenu(self)
+        style_icon_context_menu(menu)
+        add = menu.addAction("Add Windows app...")
+        menu.addSeparator()
+        exit_action = menu.addAction("Exit dock")
+        self.icon_menu_open = True
+        self.hide_deadline = None
+        try:
+            chosen = menu.exec(self.mapToGlobal(event.pos()))
+        finally:
+            self.icon_menu_open = False
+            self.allow_context_return()
+        if chosen == add:
+            self.browse_windows_apps()
+        elif chosen == exit_action:
+            QApplication.instance().quit()
+
+    def windows_app_icon(self, app_id, name):
+        """Look up actual installed-app art, preferring package manifest assets."""
+        if not hasattr(self, "_windows_app_icon_cache"):
+            self._windows_app_icon_cache = {}
+        if app_id in self._windows_app_icon_cache:
+            return self._windows_app_icon_cache[app_id]
+        icon = QIcon()
+        # Packaged apps have a family name before '!'. Resolve their installed
+        # manifest and choose the highest-resolution logo asset available.
+        package_family = app_id.split("!", 1)[0]
+        for root in getattr(self, "_windows_app_packages", {}).get(package_family, []):
+            try:
+                import xml.etree.ElementTree as ET
+                manifest = Path(root) / "AppxManifest.xml"
+                if not manifest.is_file():
+                    continue
+                tree = ET.parse(str(manifest))
+                candidates = []
+                for node in tree.iter():
+                    for key, val in node.attrib.items():
+                        if key.rsplit("}", 1)[-1].lower() in (
+                                "square44x44logo", "square150x150logo", "logo"):
+                            candidates.append(val)
+                for relative in candidates:
+                    stem = Path(root) / relative.replace("\\\\", "/")
+                    files = [stem]
+                    files.extend(stem.parent.glob(
+                        stem.stem + ".scale-*" + stem.suffix))
+                    files.extend(stem.parent.glob(
+                        stem.stem + ".targetsize-*" + stem.suffix))
+                    files.extend(stem.parent.glob(
+                        stem.stem + ".scale-*.png"))
+                    files.extend(stem.parent.glob(
+                        stem.stem + ".targetsize-*.png"))
+                    for candidate in sorted(files, key=lambda f: (
+                            "targetsize-256" in f.name, "scale-400" in f.name,
+                            "scale-200" in f.name), reverse=True):
+                        if candidate.is_file():
+                            test = QIcon(str(candidate))
+                            if not test.isNull():
+                                icon = test
+                                break
+                    if not icon.isNull():
+                        break
+                if not icon.isNull():
+                    break
+            except (OSError, ValueError, ET.ParseError):
+                continue
+        if icon.isNull():
+            for folder in (Path(os.environ.get("PROGRAMDATA", r"C:\\ProgramData"))
+                           / "Microsoft/Windows/Start Menu/Programs",
+                           Path(os.environ.get("APPDATA", ""))
+                           / "Microsoft/Windows/Start Menu/Programs"):
+                if folder.is_dir():
+                    for shortcut in folder.rglob("*.lnk"):
+                        if shortcut.stem.casefold() == name.casefold():
+                            icon = self.get_shortcut_icon(shortcut)
+                            if not icon.isNull():
+                                break
+                if not icon.isNull():
+                    break
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self._windows_app_icon_cache[app_id] = icon
+        return icon
+
+    def browse_windows_apps(self):
+        """List installed Start-menu/Store apps and create a portable .lnk."""
+        dialog = QDialog(None)
+        dialog.setWindowTitle("Add Windows app to dock")
+        dialog.setWindowIcon(self.make_tray_icon())
+        dialog.resize(480, 540)
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit(dialog)
+        search.setPlaceholderText("Search installed Windows apps...")
+        layout.addWidget(search)
+        app_list = QListWidget(dialog)
+        layout.addWidget(app_list)
+        controls = QHBoxLayout()
+        add_button = QPushButton("Add to Dock", dialog)
+        cancel_button = QPushButton("Cancel", dialog)
+        controls.addStretch()
+        controls.addWidget(add_button)
+        controls.addWidget(cancel_button)
+        layout.addLayout(controls)
+        add_button.setEnabled(False)
+        app_list.itemSelectionChanged.connect(
+            lambda: add_button.setEnabled(bool(app_list.selectedItems())))
+        cancel_button.clicked.connect(dialog.reject)
+        app_list.itemDoubleClicked.connect(lambda _: dialog.accept())
+        add_button.clicked.connect(dialog.accept)
+        dark = windows_system_dark_theme()
+        bg = "#292929" if dark else "#f9f9f9"
+        fg = "#f5f5f5" if dark else "#202020"
+        dialog.setStyleSheet(
+            f"QDialog {{ background: {bg}; color: {fg}; }}"
+            f"QLabel, QLineEdit, QListWidget {{ color: {fg}; }}"
+            f"QLineEdit, QListWidget {{ background: {'#202020' if dark else '#ffffff'}; }}"
+        )
+        from PySide6.QtWidgets import QListWidgetItem
+        app_list.setIconSize(QSize(40, 40))
+        app_list.setSpacing(3)
+        app_list.setStyleSheet(app_list.styleSheet() +
+            "QListWidget::item { min-height: 48px; padding: 3px 6px; }")
+
+        def filter_apps(query):
+            for i in range(app_list.count()):
+                item = app_list.item(i)
+                item.setHidden(query.casefold() not in item.text().casefold())
+        search.textChanged.connect(filter_apps)
+
+        def fill_apps(apps):
+            app_list.clear()
+            for name, app_id in apps:
+                item = QListWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, app_id)
+                app_list.addItem(item)
+            filter_apps(search.text())
+            # Resolve expensive manifest artwork gradually, keeping the
+            # window responsive and displaying names immediately.
+            next_icon = [0]
+            def fill_icons():
+                count = 0
+                while next_icon[0] < app_list.count() and count < 5:
+                    item = app_list.item(next_icon[0])
+                    next_icon[0] += 1
+                    if item:
+                        item.setIcon(self.windows_app_icon(
+                            item.data(Qt.ItemDataRole.UserRole), item.text()))
+                    count += 1
+                if next_icon[0] < app_list.count():
+                    QTimer.singleShot(0, fill_icons)
+            QTimer.singleShot(0, fill_icons)
+
+        def apps_loaded(apps, packages, error):
+            if error:
+                app_list.clear()
+                app_list.addItem("Unable to load apps: " + error)
+                return
+            self._windows_app_packages = packages
+            self._windows_apps_cached = apps
+            fill_apps(apps)
+
+        if hasattr(self, "_windows_apps_cached"):
+            fill_apps(self._windows_apps_cached)
+        else:
+            loading_item = QListWidgetItem("Loading installed Windows apps...")
+            loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            app_list.addItem(loading_item)
+            self._apps_loader = WindowsAppsLoader(self)
+            self._apps_loader.loaded.connect(apps_loaded)
+            self._apps_loader.start()
+
+        set_native_dialog_theme(dialog)
+        self.rename_dialog_open = True
+        self.hide_deadline = None
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self.rename_dialog_open = False
+            if hasattr(self, "_apps_loader") and self._apps_loader.isRunning():
+                try:
+                    self._apps_loader.loaded.disconnect(apps_loaded)
+                except (RuntimeError, TypeError):
+                    pass
+            self.allow_context_return()
+        if not accepted or not app_list.currentItem():
+            return
+        item = app_list.currentItem()
+        self.add_windows_app(item.text(), item.data(Qt.ItemDataRole.UserRole))
+
+    def windows_app_icon_file(self, app_id, name):
+        """Write a persistent Windows-compatible PNG-compressed ICO asset.
+
+        The .lnk points at this file, so Explorer can display the actual app
+        icon even when the shortcut is dragged out of the dock.
+        """
+        cache = (Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) /
+                 "ShortcutsDock" / "AppIcons")
+        cache.mkdir(parents=True, exist_ok=True)
+        filename = hashlib.sha256(app_id.encode("utf-8")).hexdigest()[:24] + ".ico"
+        destination = cache / filename
+        if destination.is_file() and destination.stat().st_size > 100:
+            return destination
+        icon = self.windows_app_icon(app_id, name)
+        if icon.isNull():
+            return None
+        pixmap = icon.pixmap(QSize(256, 256))
+        if pixmap.isNull():
+            return None
+        image = pixmap.toImage()
+        image.setDevicePixelRatio(1.0)
+        image = image.convertToFormat(QImage.Format.Format_ARGB32)
+        # Pad to a square without stretching the source artwork.
+        if image.width() != image.height():
+            side = max(image.width(), image.height())
+            square = QImage(side, side, QImage.Format.Format_ARGB32)
+            square.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(square)
+            painter.drawImage((side-image.width())//2,
+                              (side-image.height())//2, image)
+            painter.end()
+            image = square
+        image = image.scaled(256, 256, Qt.AspectRatioMode.IgnoreAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return None
+        png = bytes(buffer.data())
+        buffer.close()
+        # ICO header, 256x256 directory entry, PNG payload.
+        ico = (struct.pack("<HHH", 0, 1, 1) +
+               struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22) + png)
+        destination.write_bytes(ico)
+        return destination
+
+    def add_windows_app(self, name, app_id):
+        """Create a real Windows shell .lnk, suitable for Explorer drag/drop."""
+        # explorer.exe resolves the AppsFolder AUMID, including packaged apps
+        # which have no ordinary executable path available to the user.
+        # A .lnk is a real filesystem object so Explorer drag-out works as
+        # it does for existing dock shortcuts.
+        safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", name).strip(" .") or "Windows App"
+        path = self.unique_path(SHORTCUTS_DIR, safe_name)
+        try:
+            link = win32com.client.Dispatch("WScript.Shell").CreateShortcut(str(path))
+            link.TargetPath = str(Path(os.environ.get("WINDIR", r"C:\\Windows")) / "explorer.exe")
+            link.Arguments = "shell:AppsFolder\\" + app_id
+            link.Description = f"Windows app: {name}"
+            icon_file = self.windows_app_icon_file(app_id, name)
+            if icon_file:
+                link.IconLocation = str(icon_file) + ",0"
+            link.Save()
+            self.save_order(self.shortcut_paths() + [path])
+            self.load_shortcuts()
+            self.allow_context_return(3.0)
+        except Exception as error:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            QMessageBox.warning(self, "Add Windows app",
+                                f"Could not add {name}:\\n{error}")
 
     def create_tray(self):
         self.tray = QSystemTrayIcon(self)
@@ -1780,6 +2678,26 @@ class ShortcutsDock(QWidget):
 
         menu.addSeparator()
 
+        icon_size_action = QWidgetAction(menu)
+        icon_size_widget = QWidget(menu)
+        icon_size_layout = QVBoxLayout(icon_size_widget)
+        icon_size_layout.setContentsMargins(12, 6, 12, 8)
+        icon_size_layout.setSpacing(4)
+        self.icon_size_label = QLabel(f"Icon size: {self.icon_size} × {self.icon_size} px")
+        icon_size_layout.addWidget(self.icon_size_label)
+        icon_size_slider = IconSizeSlider(Qt.Orientation.Horizontal)
+        icon_size_slider.setRange(ICON_SIZES[0], ICON_SIZES[-1])
+        icon_size_slider.setSingleStep(1)
+        icon_size_slider.setPageStep(1)
+        icon_size_slider.setTickInterval(16)
+        icon_size_slider.setValue(self.icon_size)
+        icon_size_slider.setMinimumWidth(190)
+        icon_size_slider.valueChanged.connect(self.change_icon_size)
+        self.style_menu_slider(icon_size_slider)
+        icon_size_layout.addWidget(icon_size_slider)
+        icon_size_action.setDefaultWidget(icon_size_widget)
+        menu.addAction(icon_size_action)
+
         spacing_action = QWidgetAction(menu)
         spacing_widget = QWidget(menu)
         spacing_layout = QVBoxLayout(spacing_widget)
@@ -1796,6 +2714,24 @@ class ShortcutsDock(QWidget):
         spacing_layout.addWidget(spacing_slider)
         spacing_action.setDefaultWidget(spacing_widget)
         menu.addAction(spacing_action)
+
+        separator_action = QWidgetAction(menu)
+        separator_widget = QWidget(menu)
+        separator_layout = QVBoxLayout(separator_widget)
+        separator_layout.setContentsMargins(12, 6, 12, 8)
+        separator_layout.setSpacing(4)
+        self.separator_distance_label = QLabel(
+            f"Separator distance: {self.separator_distance} px each side")
+        separator_layout.addWidget(self.separator_distance_label)
+        separator_slider = QSlider(Qt.Orientation.Horizontal)
+        separator_slider.setRange(0, 100)
+        separator_slider.setValue(self.separator_distance)
+        separator_slider.setMinimumWidth(190)
+        separator_slider.valueChanged.connect(self.change_separator_distance)
+        self.style_menu_slider(separator_slider)
+        separator_layout.addWidget(separator_slider)
+        separator_action.setDefaultWidget(separator_widget)
+        menu.addAction(separator_action)
 
         # Embedded slider: stays interactive while the tray menu is open.
         offset_action = QWidgetAction(menu)
@@ -1861,9 +2797,12 @@ class ShortcutsDock(QWidget):
         self.appearance_since = None
 
     def tray_activated(self, reason):
-        if reason == (
-            QSystemTrayIcon.ActivationReason.Trigger
-        ):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            # A click is a reveal request, never a toggle or animation restart.
+            if self.isVisible() and not self.animation_hiding:
+                return
+            if self.animating and not self.animation_hiding:
+                return
             self.show_dock()
 
     def show_dock(self):
