@@ -3,6 +3,12 @@
 A lightweight Windows dock mainly for program shortcuts, for cleaning up the taskbar for more important things, such as opened programs.
 
 ## Changelog
+v1.0.0.1
+November 14, 2026
+- Improved icon scaling to use original ICO resolutions when available, smooth downscaling for larger icons, and nearest-neighbor upscaling for smaller icons.
+- Added a Smooth Small Icons toggle to optionally use smooth interpolation when enlarging low-resolution icons (disabled by default).
+- Fixed oversized dock resizing to preserve the current scroll position instead of jumping back to the center.
+
 v1.0.0.0
 November 10, 2026
 - Initial release.

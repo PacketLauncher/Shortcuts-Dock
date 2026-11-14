@@ -109,6 +109,108 @@ def native_cursor_and_monitor():
     return point, info.rcMonitor
 
 
+def embedded_executable_icon(executable):
+    """Extract native RT_GROUP_ICON/RT_ICON frames from a Windows executable.
+
+    QFileIconProvider sometimes returns a tiny shell thumbnail inside a large
+    canvas. Reading the actual PE icon group gives Qt the original frames.
+    The ICO is cached, so extraction only happens once per executable version.
+    """
+    try:
+        executable = Path(executable)
+        stat = executable.stat()
+        token = f"{executable.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        cache_dir = (Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) /
+                     "ShortcutsDock" / "ExecutableIcons")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        destination = cache_dir / (hashlib.sha256(
+            token.encode("utf-8")).hexdigest()[:32] + ".ico")
+        if destination.is_file() and destination.stat().st_size > 22:
+            return destination
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+        kernel.LoadLibraryExW.restype = wintypes.HMODULE
+        kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+        kernel.FreeLibrary.restype = wintypes.BOOL
+        kernel.EnumResourceNamesW.argtypes = [
+            wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        kernel.EnumResourceNamesW.restype = wintypes.BOOL
+        kernel.FindResourceW.argtypes = [
+            wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p]
+        kernel.FindResourceW.restype = ctypes.c_void_p
+        kernel.LoadResource.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+        kernel.LoadResource.restype = ctypes.c_void_p
+        kernel.LockResource.argtypes = [ctypes.c_void_p]
+        kernel.LockResource.restype = ctypes.c_void_p
+        kernel.SizeofResource.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+        kernel.SizeofResource.restype = wintypes.DWORD
+
+        handle = kernel.LoadLibraryExW(str(executable), None, 0x00000002)
+        if not handle:
+            return None
+        try:
+            groups = []
+            callback_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HMODULE, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p)
+
+            def collect(_module, _kind, name, _param):
+                # Resource names may be numeric IDs or string pointers.
+                groups.append(name)
+                return True
+
+            callback = callback_type(collect)
+            kernel.EnumResourceNamesW(handle, ctypes.c_void_p(14),
+                                      callback, None)
+            if not groups:
+                return None
+
+            def resource(kind, name):
+                found = kernel.FindResourceW(handle, ctypes.c_void_p(name),
+                                             ctypes.c_void_p(kind))
+                if not found:
+                    return None
+                size = kernel.SizeofResource(handle, found)
+                loaded = kernel.LoadResource(handle, found)
+                pointer = kernel.LockResource(loaded) if loaded else None
+                return ctypes.string_at(pointer, size) if pointer and size else None
+
+            group = resource(14, groups[0])
+            if not group or len(group) < 6:
+                return None
+            reserved, kind, count = struct.unpack_from("<HHH", group)
+            if reserved or kind != 1 or not count:
+                return None
+            entries = []
+            for index in range(min(count, 256)):
+                offset = 6 + index * 14
+                if offset + 14 > len(group):
+                    break
+                width, height, colors, reserved, planes, bits, size, icon_id = (
+                    struct.unpack_from("<BBBBHHIH", group, offset))
+                blob = resource(3, icon_id)
+                if blob:
+                    entries.append((width, height, colors, planes, bits, blob))
+            if not entries:
+                return None
+            output = bytearray(struct.pack("<HHH", 0, 1, len(entries)))
+            offset = 6 + len(entries) * 16
+            for width, height, colors, planes, bits, blob in entries:
+                output.extend(struct.pack("<BBBBHHII", width, height, colors,
+                                          0, planes, bits, len(blob), offset))
+                offset += len(blob)
+            for _width, _height, _colors, _planes, _bits, blob in entries:
+                output.extend(blob)
+            destination.write_bytes(output)
+            return destination
+        finally:
+            kernel.FreeLibrary(handle)
+    except (OSError, ValueError, TypeError, struct.error) as error:
+        print(f"Embedded icon extraction failed for {executable}: {error}")
+        return None
+
+
 def windows_accent_color():
     """Read the actual Windows accent selected in Personalization > Colors."""
     try:
@@ -345,10 +447,10 @@ class ShortcutButton(QPushButton):
                 target.setHeight(requested)
                 # Preserve pixel-art crispness at exact integer enlargements.
                 # Otherwise use smooth interpolation for noninteger scaling.
-                integer_upscale = (native_size > 0 and requested >= native_size
-                                   and requested % native_size == 0)
+                integer_upscale = (native_size > 0 and requested > native_size)
                 if integer_upscale and requested > native_size:
-                    cache_key = (source.cacheKey(), requested)
+                    smooth = self.dock.smooth_small_icons
+                    cache_key = (source.cacheKey(), requested, smooth)
                     scaled = self._integer_cache.get(cache_key)
                     if scaled is None:
                         image = source.toImage()
@@ -356,7 +458,8 @@ class ShortcutButton(QPushButton):
                         image = image.scaled(
                             requested, requested,
                             Qt.AspectRatioMode.IgnoreAspectRatio,
-                            Qt.TransformationMode.FastTransformation)
+                            (Qt.TransformationMode.SmoothTransformation if smooth
+                             else Qt.TransformationMode.FastTransformation))
                         scaled = QPixmap.fromImage(image)
                         self._integer_cache[cache_key] = scaled
                     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -376,16 +479,18 @@ class ShortcutButton(QPushButton):
         if source.isNull():
             return result
         painter = QPainter(result)
-        integer = native > 0 and requested > native and requested % native == 0
+        integer = native > 0 and requested > native
         if integer:
-            key = (source.cacheKey(), requested)
+            smooth = self.dock.smooth_small_icons
+            key = (source.cacheKey(), requested, smooth)
             scaled = self._integer_cache.get(key)
             if scaled is None:
                 image = source.toImage()
                 image.setDevicePixelRatio(1.0)
                 scaled = QPixmap.fromImage(image.scaled(
                     requested, requested, Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.FastTransformation))
+                    (Qt.TransformationMode.SmoothTransformation if smooth
+                     else Qt.TransformationMode.FastTransformation)))
                 self._integer_cache[key] = scaled
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
             painter.drawPixmap(QPoint(0, 0), scaled)
@@ -396,104 +501,82 @@ class ShortcutButton(QPushButton):
         return result
 
     def _icon_source_pixmap(self, requested):
+        """Choose embedded icon frames by resolution, never by alpha bounds.
+
+        Exact native size -> that original frame.
+        Between native sizes -> smooth downscale from the largest frame.
+        Above the largest native size -> nearest-neighbor enlargement.
+        No cropping: transparent margins belong to the original artwork.
+        """
         icon = self.icon()
         key = icon.cacheKey()
         if getattr(self, "_source_icon_key", None) != key:
             self._source_icon_key = key
             self._source_pixmaps = {}
-            self._trim_cache = {}
             self._integer_cache = {}
-            self._native_sizes = sorted({sz.width() for sz in icon.availableSizes()
-                                         if sz.width() == sz.height() and sz.width() > 0})
+            self._native_sizes = sorted({
+                sz.width() for sz in icon.availableSizes()
+                if sz.width() == sz.height() and sz.width() > 0
+            })
 
         sizes = self._native_sizes
         if sizes:
-            # Use the exact frame when present; for in-between sizes prefer
-            # downscaling a larger frame, except above the largest native frame.
             if requested in sizes:
                 native = requested
+            elif requested < sizes[-1]:
+                # Prefer the highest-quality available source, e.g. 256px.
+                native = sizes[-1]
             else:
-                integer_sources = [n for n in sizes if n < requested and requested % n == 0]
-                native = max(integer_sources) if integer_sources else next(
-                    (n for n in sizes if n >= requested), sizes[-1])
+                native = sizes[-1]
         else:
-            # Shell icon engines may not advertise their actual ICO sizes.
-            # Request the current dimension directly instead of stretching a
-            # single 256px image across every possible size.
+            # Shell icon providers do not always advertise embedded sizes.
+            # Preserve their existing direct-request behavior.
             native = requested
+
         if native not in self._source_pixmaps:
             self._source_pixmaps[native] = icon.pixmap(QSize(native, native))
         pixmap = self._source_pixmaps[native]
-        actual = round(pixmap.width() / max(1.0, pixmap.devicePixelRatio()))
-        # The Windows shell icon engine sometimes returns a 16px bitmap even
-        # when asked for 32px or more. In that case prefer the largest cached
-        # *real* bitmap, rather than repeatedly enlarging a tiny fallback.
-        if not sizes and actual < requested:
-            for probe in (256, 128, 96, 64, 48, 32):
-                if probe <= actual:
-                    break
-                if probe not in self._source_pixmaps:
-                    self._source_pixmaps[probe] = icon.pixmap(QSize(probe, probe))
-                candidate = self._source_pixmaps[probe]
-                candidate_size = round(candidate.width() / max(1.0, candidate.devicePixelRatio()))
-                if candidate_size > actual:
-                    pixmap, actual = candidate, candidate_size
-                    break
-        # Some Windows icon engines return a 256px canvas containing only a
-        # 16/32px picture. Crop the empty padding rather than scaling the canvas.
-        # Keep this cached: scanning pixels during every paint causes flicker.
-        cache_key = (native, pixmap.cacheKey())
-        if cache_key not in self._trim_cache:
-            trimmed_pixmap = pixmap
-            if not pixmap.isNull() and pixmap.width() >= 48:
-                image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
-                left, top = image.width(), image.height()
-                right = bottom = -1
-                for y in range(image.height()):
-                    for x in range(image.width()):
-                        if (image.pixel(x, y) >> 24) & 255 >= 16:
-                            left = min(left, x)
-                            top = min(top, y)
-                            right = max(right, x)
-                            bottom = max(bottom, y)
-                if right >= left and bottom >= top:
-                    width, height = right - left + 1, bottom - top + 1
-                    if max(width, height) <= max(image.width(), image.height()) * .62:
-                        # Center the actual graphic in a square transparent canvas.
-                        side = max(width, height)
-                        crop = pixmap.copy(left, top, width, height)
-                        square = QPixmap(side, side)
-                        square.fill(Qt.GlobalColor.transparent)
-                        cp = QPainter(square)
-                        cp.drawPixmap((side - width)//2, (side - height)//2, crop)
-                        cp.end()
-                        trimmed_pixmap = square
-            self._trim_cache[cache_key] = trimmed_pixmap
-        pixmap = self._trim_cache[cache_key]
-        actual = round(pixmap.width() / max(1.0, pixmap.devicePixelRatio()))
-        return pixmap, (native if sizes and pixmap is self._source_pixmaps.get(native) else actual)
+        if pixmap.isNull():
+            return pixmap, native
+
+        if not sizes:
+            # Qt's shell provider may return a tiny actual bitmap.
+            actual = round(pixmap.width() / max(1.0, pixmap.devicePixelRatio()))
+            if actual < requested:
+                for probe in (256, 128, 96, 64, 48, 32):
+                    if probe not in self._source_pixmaps:
+                        self._source_pixmaps[probe] = icon.pixmap(QSize(probe, probe))
+                    candidate = self._source_pixmaps[probe]
+                    candidate_size = round(
+                        candidate.width() / max(1.0, candidate.devicePixelRatio()))
+                    if candidate_size > actual:
+                        pixmap, actual = candidate, candidate_size
+                native = actual
+
+        return pixmap, native
 
     def prepare_icon_frames(self):
         """Warm icon and integer-size caches outside resize/paint callbacks."""
         if self.icon().isNull():
             return
-        # Accessing the native representations once also caches expensive
-        # transparent-border detection for each frame.
+        # Cache native frames and commonly requested enlargements.
         self._icon_source_pixmap(self.iconSize().width())
         native_sizes = list(self._native_sizes)
         for native in native_sizes:
             self._icon_source_pixmap(native)
         for requested in ICON_SIZES:
             source, native = self._icon_source_pixmap(requested)
-            if source.isNull() or native <= 0 or requested <= native or requested % native:
+            if source.isNull() or native <= 0 or requested <= native:
                 continue
-            key = (source.cacheKey(), requested)
+            key = (source.cacheKey(), requested, self.dock.smooth_small_icons)
             if key not in self._integer_cache:
                 image = source.toImage()
                 image.setDevicePixelRatio(1.0)
                 image = image.scaled(requested, requested,
                     Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.FastTransformation)
+                    (Qt.TransformationMode.SmoothTransformation
+                     if self.dock.smooth_small_icons
+                     else Qt.TransformationMode.FastTransformation))
                 self._integer_cache[key] = QPixmap.fromImage(image)
 
     def enterEvent(self, event):
@@ -678,6 +761,9 @@ class ShortcutsDock(QWidget):
         self._rendered_icon_size = self.icon_size
         self._center_overflow_on_resize = True
         self.reverse_scroll = self.settings.value("reverse_scroll", False, type=bool)
+        self.smooth_small_icons = self.settings.value(
+            "smooth_small_icons", False, type=bool)
+        self._resize_scroll_fraction = None
 
         self.auto_hide = self.settings.value("auto_hide", False, type=bool)
         self.hide_delay = max(0, min(3000, int(self.settings.value("hide_delay", 500))))
@@ -902,6 +988,12 @@ class ShortcutsDock(QWidget):
                 if os.path.isdir(target_path):
                     return self.icon_provider.icon(QFileInfo(target_path))
                 if os.path.isfile(target_path):
+                    if Path(target_path).suffix.lower() == ".exe":
+                        native_ico = embedded_executable_icon(target_path)
+                        if native_ico:
+                            icon = QIcon(str(native_ico))
+                            if not icon.isNull():
+                                return icon
                     if Path(target_path).suffix.lower() == ".ico":
                         icon = QIcon(target_path)
                         if not icon.isNull():
@@ -1647,8 +1739,17 @@ class ShortcutsDock(QWidget):
         size = max(ICON_SIZES[0], min(ICON_SIZES[-1], round(float(value))))
         if size == self._rendered_icon_size:
             return
+        horizontal = self.position in ("Bottom", "Top")
+        scroll_bar = (self.scroll_area.horizontalScrollBar() if horizontal
+                      else self.scroll_area.verticalScrollBar())
+        # Keep the same relative part of an overflowing dock in view.
+        # At initial overflow, default to center; after manual scrolling,
+        # retain that scroll fraction through every resize frame.
+        self._resize_scroll_fraction = (
+            scroll_bar.value() / scroll_bar.maximum()
+            if scroll_bar.maximum() > 0 else 0.5)
         self._rendered_icon_size = size
-        self._center_overflow_on_resize = True
+        self._center_overflow_on_resize = False
         self.button_size = size + 16
         self.setUpdatesEnabled(False)
         for i in range(self.layout.count()):
@@ -1691,6 +1792,17 @@ class ShortcutsDock(QWidget):
         self.spacing_label.setText(f"Icon spacing: {value} px")
         self.layout.setSpacing(value)
         self.update_orientation()
+
+    def change_smooth_small_icons(self, checked):
+        self.smooth_small_icons = bool(checked)
+        self.settings.setValue("smooth_small_icons", self.smooth_small_icons)
+        self.allow_context_return()
+        # Cached representations are keyed by interpolation mode.
+        # Repaint immediately; existing native frames are unchanged.
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if isinstance(widget, ShortcutButton) and not isinstance(widget, SeparatorButton):
+                widget.update()
 
     def change_reverse_scroll(self, checked):
         self.reverse_scroll = checked
@@ -1853,7 +1965,12 @@ class ShortcutsDock(QWidget):
         self.layout.activate()
         # The viewport is clipped at the screen size. When resizing, center
         # the entire icon strip under it so BOTH ends overflow equally.
-        if self._center_overflow_on_resize:
+        if self._resize_scroll_fraction is not None:
+            bar = (self.scroll_area.horizontalScrollBar() if horizontal
+                   else self.scroll_area.verticalScrollBar())
+            bar.setValue(round(bar.maximum() * self._resize_scroll_fraction))
+            self._resize_scroll_fraction = None
+        elif self._center_overflow_on_resize:
             bar = (self.scroll_area.horizontalScrollBar() if horizontal
                    else self.scroll_area.verticalScrollBar())
             bar.setValue((bar.minimum() + bar.maximum()) // 2)
@@ -2627,6 +2744,12 @@ class ShortcutsDock(QWidget):
         auto_hide_action.setChecked(self.auto_hide)
         auto_hide_action.toggled.connect(self.change_auto_hide)
         menu.addAction(auto_hide_action)
+
+        smooth_action = QAction("Smooth Small Icons", self)
+        smooth_action.setCheckable(True)
+        smooth_action.setChecked(self.smooth_small_icons)
+        smooth_action.toggled.connect(self.change_smooth_small_icons)
+        menu.addAction(smooth_action)
 
         reverse_action = QAction("Reverse Icon Scrolling", self)
         reverse_action.setCheckable(True)
